@@ -1,7 +1,38 @@
 # Portable — overlay onto common/yubi_devices.yaml
-# Adds: center_camera (USB cam replacing RealSense), task_command_dispatch_node
-# (Quest controller button mapping). No footpedal_node section — that node
-# is intentionally skipped (no footpedal hardware in portable variant).
+# Adds: hand cameras (left/right), center_camera (USB cam replacing RealSense),
+# task_command_dispatch_node (Quest controller button mapping). No
+# footpedal_node section — that node is intentionally skipped (no footpedal
+# hardware in portable variant).
+
+left_camera/usb_cam:
+  ros__parameters:
+    video_device: "/dev/yubi_left_camera"
+    framerate: 120.0
+    image_width: 640
+    image_height: 480
+    pixel_format: "mjpeg2rgb"
+    io_method: "mmap"
+    camera_name: "left_camera"
+    frame_id: "left_camera_optical_frame"
+    controls:
+      brightness: 50
+      white_balance_automatic: true
+      auto_exposure: 3
+
+right_camera/usb_cam:
+  ros__parameters:
+    video_device: "/dev/yubi_right_camera"
+    framerate: 120.0
+    image_width: 640
+    image_height: 480
+    pixel_format: "mjpeg2rgb"
+    io_method: "mmap"
+    camera_name: "right_camera"
+    frame_id: "right_camera_optical_frame"
+    controls:
+      brightness: 50
+      white_balance_automatic: true
+      auto_exposure: 3
 
 center_camera/usb_cam:
   ros__parameters:

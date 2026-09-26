@@ -1,6 +1,37 @@
 # Stationary (yagura) — overlay onto common/yubi_devices.yaml
-# Adds: footpedal_node (presence marker), task_command_dispatch_node (footpedal
-# button mapping), /camera/camera (RealSense head camera).
+# Adds: hand cameras (left/right), footpedal_node (presence marker),
+# task_command_dispatch_node (footpedal button mapping), /camera/camera
+# (RealSense head camera).
+
+left_camera/usb_cam:
+  ros__parameters:
+    video_device: "/dev/yubi_left_camera"
+    framerate: 120.0
+    image_width: 640
+    image_height: 480
+    pixel_format: "mjpeg2rgb"
+    io_method: "mmap"
+    camera_name: "left_camera"
+    frame_id: "left_camera_optical_frame"
+    controls:
+      brightness: 50
+      white_balance_automatic: true
+      auto_exposure: 3
+
+right_camera/usb_cam:
+  ros__parameters:
+    video_device: "/dev/yubi_right_camera"
+    framerate: 120.0
+    image_width: 640
+    image_height: 480
+    pixel_format: "mjpeg2rgb"
+    io_method: "mmap"
+    camera_name: "right_camera"
+    frame_id: "right_camera_optical_frame"
+    controls:
+      brightness: 50
+      white_balance_automatic: true
+      auto_exposure: 3
 
 footpedal_node:
   ros__parameters: {}

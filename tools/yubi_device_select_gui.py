@@ -6,7 +6,9 @@ generation.
 
 Variant-aware: ``--variant stationary`` (default) expects 2 cameras (L/R);
 ``--variant portable`` expects 3 cameras (L/R/center) because the portable
-head camera is the same USB model as the hand cameras.
+head camera is the same USB model as the hand cameras. The single-hand
+variants ``--variant portable_left`` / ``--variant portable_right`` expect
+2 cameras (one hand + center) and a single encoder.
 
 The L/R assignment is bootstrapped from two pieces of side-channel information:
   1. The encoder firmware may emit lines prefixed with "L001," / "R001,". When
@@ -43,15 +45,21 @@ from typing import Any, Dict, List, Optional, Tuple
 # Matches a USB topology path component such as "1-1.4" or "1-1.4.2".
 _USB_LOC_RE = re.compile(r"^\d+-[\d.]+$")
 
-SUPPORTED_VARIANTS = ("stationary", "portable")
+SUPPORTED_VARIANTS = ("stationary", "portable", "portable_left", "portable_right")
 CAM_SIDES_BY_VARIANT: Dict[str, Tuple[str, ...]] = {
     "stationary": ("left", "right"),
     "portable": ("left", "right", "center"),
+    "portable_left": ("left", "center"),
+    "portable_right": ("right", "center"),
 }
 EXPECTED_CAM_COUNT: Dict[str, int] = {
     "stationary": 2,
     "portable": 3,
+    "portable_left": 2,
+    "portable_right": 2,
 }
+# Single-hand variants: exactly one gripper (camera + encoder) is present.
+SINGLE_HAND_VARIANTS: Tuple[str, ...] = ("portable_left", "portable_right")
 
 
 def cam_sides_for(variant: str) -> Tuple[str, ...]:
@@ -61,11 +69,27 @@ def cam_sides_for(variant: str) -> Tuple[str, ...]:
     return CAM_SIDES_BY_VARIANT[variant]
 
 
+def gripper_sides_for(variant: str) -> Tuple[str, ...]:
+    """Return the gripper-side role names (no 'center') for the given variant.
+
+    stationary/portable  -> ("left", "right")
+    portable_left        -> ("left",)
+    portable_right       -> ("right",)
+    """
+    return tuple(s for s in cam_sides_for(variant) if s != "center")
+
+
+def expected_esp_count(variant: str) -> int:
+    """Number of gripper encoder (ESP32) devices the variant expects."""
+    return 1 if variant in SINGLE_HAND_VARIANTS else 2
+
+
 def validate_cam_count(variant: str, count: int) -> Optional[str]:
     """Return an error message if the count is wrong for the variant, else None.
 
     portable requires exactly 3 cameras (L/R/center, all same USB model).
     stationary requires exactly 2 cameras (L/R).
+    portable_left / portable_right require exactly 2 cameras (hand + center).
     """
     if variant not in EXPECTED_CAM_COUNT:
         return (
@@ -226,6 +250,49 @@ def assign_camera_roles(
     }
 
 
+def assign_camera_roles_single(
+    cam_devs_with_hub: List[Tuple[str, Optional[str]]],
+    esp_hub: Optional[str],
+    hand_side: str,
+) -> Dict[str, Any]:
+    """Decide which physical camera dev plays each role on a single-hand rig.
+
+    Inputs:
+      cam_devs_with_hub: ordered list of (dev_path, hub) for the 2 cameras
+                         (hand + center/head).
+      esp_hub: hub string of the single ESP device (output of usb_hub_of).
+               May be None when unknown — auto-match is skipped in that case.
+      hand_side: "left" or "right" — the variant's gripper side.
+
+    Returns:
+      {
+        hand_side: dev|None,       # key is the literal hand_side value
+        "center": dev|None,
+        "matched": bool,           # True iff the hand camera was hub-matched
+      }
+
+    The hand camera is the ESP's USB-hub mate; the remaining camera is the
+    center/head camera. Fallback when no hub match: the first camera in input
+    order is the hand, the other is center.
+    """
+    devs = [d for (d, _h) in cam_devs_with_hub]
+    hubs = {d: h for (d, h) in cam_devs_with_hub}
+
+    hand_dev: Optional[str] = None
+    matched = False
+    if esp_hub:
+        for d in devs:
+            if hubs.get(d) == esp_hub:
+                hand_dev = d
+                matched = True
+                break
+    if hand_dev is None:
+        hand_dev = devs[0] if devs else None
+    center_dev = next((d for d in devs if d != hand_dev), None)
+
+    return {hand_side: hand_dev, "center": center_dev, "matched": matched}
+
+
 def resolve_camera_pick(
     roles: Dict[str, Optional[str]],
     side: str,
@@ -264,38 +331,62 @@ def resolve_camera_pick(
     return out
 
 
-def can_apply_portable(
+def can_apply(
+    variant: str,
     esp_side_detected: Dict[str, Optional[str]],
     cam_role: Dict[str, Optional[str]],
 ) -> Optional[str]:
-    """Return an error string if portable APPLY is not ready, else None.
+    """Return an error string if APPLY is not ready, else None.
 
-    Checks (in priority order):
-      1. Both ESP devnodes have observed a labelled side ("L001," / "R001,").
-         This is the "gripper L/R info must be flowing" requirement.
-      2. All three camera roles (left/right/center) are set.
-      3. The three camera devs are mutually distinct.
+    Portable-family gate (portable, portable_left, portable_right). Checks
+    (in priority order):
+      1. Every ESP devnode has observed a labelled side ("L001," / "R001,").
+         This is the "gripper side info must be flowing" requirement.
+      2. Single-hand variants: the observed label matches the variant's
+         gripper side (e.g. an "R###" encoder on a portable_left rig is a
+         mismatch — wrong firmware DEVICE_ID or wrong --variant).
+      3. All camera roles are set.
+      4. The camera devs are mutually distinct.
     """
     missing_label = [dev for dev, side in esp_side_detected.items() if not side]
     if missing_label:
         return (
             "Encoder L/R label not observed yet on: "
             + ", ".join(sorted(missing_label))
-            + ". Wait for 'L001,' / 'R001,' lines from both grippers before APPLY."
+            + ". Wait for 'L001,' / 'R001,' lines from every gripper before APPLY."
         )
 
-    unset = [s for s in ("left", "right", "center") if not cam_role.get(s)]
+    if variant in SINGLE_HAND_VARIANTS:
+        hand_side = gripper_sides_for(variant)[0]
+        for dev, side in sorted(esp_side_detected.items()):
+            if side != hand_side:
+                return (
+                    f"Encoder on {dev} reports side {side.upper()}, but variant "
+                    f"{variant} expects {hand_side.upper()}. Check the encoder "
+                    "firmware DEVICE_ID or re-run with the correct --variant."
+                )
+
+    sides = cam_sides_for(variant)
+    unset = [s for s in sides if not cam_role.get(s)]
     if unset:
         return f"Camera assignment incomplete: {', '.join(unset)} unset."
 
-    devs = [cam_role["left"], cam_role["right"], cam_role["center"]]
-    if len(set(devs)) != 3:
+    devs = [cam_role[s] for s in sides]
+    if len(set(devs)) != len(devs):
         return (
             f"Camera roles must be distinct devices, got "
-            f"left={cam_role['left']} right={cam_role['right']} "
-            f"center={cam_role['center']}."
+            + ", ".join(f"{s}={cam_role[s]}" for s in sides)
+            + "."
         )
     return None
+
+
+def can_apply_portable(
+    esp_side_detected: Dict[str, Optional[str]],
+    cam_role: Dict[str, Optional[str]],
+) -> Optional[str]:
+    """Backward-compatible wrapper of can_apply() for the dual-hand portable variant."""
+    return can_apply("portable", esp_side_detected, cam_role)
 
 
 def build_apply_payload(
@@ -308,35 +399,32 @@ def build_apply_payload(
     """Build the JSON payload emitted by the GUI on APPLY.
 
     Stationary keeps the original shape (no "center" key). Portable adds
-    ``camera.center.dev``.
+    ``camera.center.dev``. Single-hand variants (portable_left/portable_right)
+    include only the present gripper side in the esp32 block and the
+    encoder_node min parameter (e.g. left_min_raw only).
     """
-    out: Dict[str, Any] = {
-        "camera": {
-            "left": {"dev": cam_role["left"]},
-            "right": {"dev": cam_role["right"]},
-        },
-        "esp32": {
-            "left": {
-                "dev": esp_role["left"],
-                "serial": esp_serials[esp_role["left"]],
-                "min": calib_min[esp_role["left"]],
-            },
-            "right": {
-                "dev": esp_role["right"],
-                "serial": esp_serials[esp_role["right"]],
-                "min": calib_min[esp_role["right"]],
-            },
-        },
+    sides = cam_sides_for(variant)
+    gripper_sides = gripper_sides_for(variant)
+
+    camera = {s: {"dev": cam_role[s]} for s in sides}
+    esp32: Dict[str, Any] = {}
+    encoder_params: Dict[str, Any] = {}
+    for s in gripper_sides:
+        dev = esp_role[s]
+        esp32[s] = {
+            "dev": dev,
+            "serial": esp_serials[dev],
+            "min": calib_min[dev],
+        }
+        encoder_params[f"{s}_min_raw"] = calib_min[dev]
+
+    return {
+        "camera": camera,
+        "esp32": esp32,
         "encoder_node": {
-            "ros__parameters": {
-                "left_min_raw": calib_min[esp_role["left"]],
-                "right_min_raw": calib_min[esp_role["right"]],
-            }
+            "ros__parameters": encoder_params,
         },
     }
-    if variant == "portable":
-        out["camera"]["center"] = {"dev": cam_role["center"]}
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -533,61 +621,61 @@ def _run_gui(args: argparse.Namespace) -> None:
                 pass
 
     class App:
-        """Variant-aware LEFT/RIGHT (+CENTER) setup UI.
+        """Variant-aware camera/encoder setup UI.
 
         Architectural invariant: the role dicts (``cam_role`` and ``esp_role``)
         are the single source of truth for which physical device plays which
         side. All UI widgets are keyed by side name, so swapping reduces to
         swapping values in those dicts.
+
+        Single-hand variants (portable_left / portable_right) carry one
+        gripper side: one encoder section, one hand camera plus the
+        center/head camera, and no swap buttons.
         """
 
         def __init__(
             self,
             root: tk.Tk,
             cam_devs: List[str],
-            esp_a: EspDev,
-            esp_b: EspDev,
+            esp_devs: List[EspDev],
             baud: int,
             variant: str,
         ):
             self.root = root
             self.cam_devs = list(cam_devs)
-            self.esp_a = esp_a
-            self.esp_b = esp_b
+            self.esp_devs = list(esp_devs)
             self.baud = baud
             self.variant = variant
             self.cam_sides: Tuple[str, ...] = cam_sides_for(variant)
+            self.gripper_sides: Tuple[str, ...] = gripper_sides_for(variant)
+            self.is_single = variant in SINGLE_HAND_VARIANTS
 
             self.q: "queue.Queue" = queue.Queue()
 
             # Default ordering as a starting point. Replaced by try_auto_assign()
-            # when both encoders emit labelled lines.
+            # when the encoder(s) emit labelled lines.
             initial_roles: Dict[str, Optional[str]] = {}
             for i, side in enumerate(self.cam_sides):
                 initial_roles[side] = self.cam_devs[i] if i < len(self.cam_devs) else None
             self.cam_role: Dict[str, Optional[str]] = initial_roles
             self.esp_role: Dict[str, Optional[str]] = {
-                "left": esp_a.device,
-                "right": esp_b.device,
+                side: dev.device
+                for side, dev in zip(self.gripper_sides, self.esp_devs)
             }
 
             self.esp_side_detected: Dict[str, Optional[str]] = {
-                esp_a.device: None,
-                esp_b.device: None,
+                d.device: None for d in self.esp_devs
             }
             self.auto_assigned: bool = False
 
             self.data: Dict[str, List[Tuple[float, float]]] = {
-                esp_a.device: [],
-                esp_b.device: [],
+                d.device: [] for d in self.esp_devs
             }
             self.latest: Dict[str, Optional[float]] = {
-                esp_a.device: None,
-                esp_b.device: None,
+                d.device: None for d in self.esp_devs
             }
             self.calib_min: Dict[str, Optional[float]] = {
-                esp_a.device: None,
-                esp_b.device: None,
+                d.device: None for d in self.esp_devs
             }
 
             # Widget refs keyed by side
@@ -619,9 +707,11 @@ def _run_gui(args: argparse.Namespace) -> None:
             cols = ttk.Frame(outer)
             cols.grid(row=0, column=0, sticky="nsew")
             cols.columnconfigure(0, weight=1)
-            cols.columnconfigure(2, weight=1)
+            if len(self.gripper_sides) == 2:
+                cols.columnconfigure(2, weight=1)
 
-            # Row 0: CENTER camera (portable only) at the top, spanning all 3 cols.
+            # Row 0: CENTER camera (variants with a center cam) at the top,
+            # spanning all 3 cols.
             row_cursor = 0
             if "center" in self.cam_sides:
                 ttk.Label(
@@ -635,37 +725,55 @@ def _run_gui(args: argparse.Namespace) -> None:
                 )
                 row_cursor += 1
 
-            # L/R column headers
-            ttk.Label(cols, text="LEFT", font=("Sans", 12, "bold"), anchor="center").grid(
-                row=row_cursor, column=0, sticky="ew"
-            )
-            ttk.Label(cols, text="RIGHT", font=("Sans", 12, "bold"), anchor="center").grid(
-                row=row_cursor, column=2, sticky="ew"
-            )
-            row_cursor += 1
+            if len(self.gripper_sides) == 2:
+                # Dual-hand: L/R column headers
+                ttk.Label(cols, text="LEFT", font=("Sans", 12, "bold"), anchor="center").grid(
+                    row=row_cursor, column=0, sticky="ew"
+                )
+                ttk.Label(cols, text="RIGHT", font=("Sans", 12, "bold"), anchor="center").grid(
+                    row=row_cursor, column=2, sticky="ew"
+                )
+                row_cursor += 1
 
-            # Camera row (L/R)
-            self._build_camera_section(cols, "left").grid(
-                row=row_cursor, column=0, sticky="nsew", padx=4, pady=4
-            )
-            ttk.Button(cols, text="Swap\nCameras", command=self.swap_cam, width=12).grid(
-                row=row_cursor, column=1, padx=8
-            )
-            self._build_camera_section(cols, "right").grid(
-                row=row_cursor, column=2, sticky="nsew", padx=4, pady=4
-            )
-            row_cursor += 1
+                # Camera row (L/R)
+                self._build_camera_section(cols, "left").grid(
+                    row=row_cursor, column=0, sticky="nsew", padx=4, pady=4
+                )
+                ttk.Button(cols, text="Swap\nCameras", command=self.swap_cam, width=12).grid(
+                    row=row_cursor, column=1, padx=8
+                )
+                self._build_camera_section(cols, "right").grid(
+                    row=row_cursor, column=2, sticky="nsew", padx=4, pady=4
+                )
+                row_cursor += 1
 
-            # Encoder row
-            self._build_encoder_section(cols, "left").grid(
-                row=row_cursor, column=0, sticky="nsew", padx=4, pady=4
-            )
-            ttk.Button(cols, text="Swap\nEncoders", command=self.swap_esp, width=12).grid(
-                row=row_cursor, column=1, padx=8
-            )
-            self._build_encoder_section(cols, "right").grid(
-                row=row_cursor, column=2, sticky="nsew", padx=4, pady=4
-            )
+                # Encoder row
+                self._build_encoder_section(cols, "left").grid(
+                    row=row_cursor, column=0, sticky="nsew", padx=4, pady=4
+                )
+                ttk.Button(cols, text="Swap\nEncoders", command=self.swap_esp, width=12).grid(
+                    row=row_cursor, column=1, padx=8
+                )
+                self._build_encoder_section(cols, "right").grid(
+                    row=row_cursor, column=2, sticky="nsew", padx=4, pady=4
+                )
+            else:
+                # Single-hand: one labeled column (hand side only)
+                hand_side = self.gripper_sides[0]
+                ttk.Label(
+                    cols,
+                    text=f"{hand_side.upper()} (HAND)",
+                    font=("Sans", 12, "bold"),
+                    anchor="center",
+                ).grid(row=row_cursor, column=0, sticky="ew")
+                row_cursor += 1
+                self._build_camera_section(cols, hand_side).grid(
+                    row=row_cursor, column=0, sticky="nsew", padx=4, pady=4
+                )
+                row_cursor += 1
+                self._build_encoder_section(cols, hand_side).grid(
+                    row=row_cursor, column=0, sticky="nsew", padx=4, pady=4
+                )
 
             self.auto_status_lbl = ttk.Label(
                 outer,
@@ -691,13 +799,14 @@ def _run_gui(args: argparse.Namespace) -> None:
             self.cam_readers: List[CamReader] = [
                 CamReader(d, self.q, chr(ord("A") + i)) for i, d in enumerate(self.cam_devs)
             ]
-            self.esp_reader_a = EspSerialReader(self.esp_a.device, baud, self.q)
-            self.esp_reader_b = EspSerialReader(self.esp_b.device, baud, self.q)
+            self.esp_readers: List[EspSerialReader] = [
+                EspSerialReader(d.device, baud, self.q) for d in self.esp_devs
+            ]
 
             for r in self.cam_readers:
                 r.start()
-            self.esp_reader_a.start()
-            self.esp_reader_b.start()
+            for r in self.esp_readers:
+                r.start()
 
             self.root.after(50, self.tick)
 
@@ -761,11 +870,13 @@ def _run_gui(args: argparse.Namespace) -> None:
                 self.cam_path_lbl[side].config(text=cam or "(unset)")
                 if side in self.cam_picker_var:
                     self.cam_picker_var[side].set(cam or "")
-            for side in ("left", "right"):
+            for side in self.gripper_sides:
                 esp = self.esp_role.get(side)
                 self.esp_path_lbl[side].config(text=esp or "(unset)")
 
         def swap_cam(self):
+            if len(self.gripper_sides) != 2:
+                return
             self.cam_role["left"], self.cam_role["right"] = (
                 self.cam_role["right"],
                 self.cam_role["left"],
@@ -773,6 +884,8 @@ def _run_gui(args: argparse.Namespace) -> None:
             self.refresh_role_labels()
 
         def swap_esp(self):
+            if len(self.gripper_sides) != 2:
+                return
             self.esp_role["left"], self.esp_role["right"] = (
                 self.esp_role["right"],
                 self.esp_role["left"],
@@ -790,7 +903,7 @@ def _run_gui(args: argparse.Namespace) -> None:
             self.refresh_role_labels()
 
         def try_auto_assign(self):
-            """Bootstrap L/R/center using detected encoder labels + USB-hub pairing.
+            """Bootstrap camera/encoder roles from encoder labels + USB-hub pairing.
 
             Runs at most once (guarded by ``self.auto_assigned``); after that
             the user owns the assignment via Swap or pulldown.
@@ -798,8 +911,12 @@ def _run_gui(args: argparse.Namespace) -> None:
             if self.auto_assigned:
                 return
 
-            side_a = self.esp_side_detected.get(self.esp_a.device)
-            side_b = self.esp_side_detected.get(self.esp_b.device)
+            if self.is_single:
+                self._try_auto_assign_single()
+                return
+
+            side_a = self.esp_side_detected.get(self.esp_devs[0].device)
+            side_b = self.esp_side_detected.get(self.esp_devs[1].device)
 
             if not side_a or not side_b:
                 if side_a or side_b:
@@ -819,16 +936,16 @@ def _run_gui(args: argparse.Namespace) -> None:
                 messagebox.showerror(
                     "Encoder side conflict",
                     f"Both ESP devices reported the same side ({side_a.upper()}):\n\n"
-                    f"  A ({self.esp_a.device}): {side_a}\n"
-                    f"  B ({self.esp_b.device}): {side_b}\n\n"
+                    f"  A ({self.esp_devs[0].device}): {side_a}\n"
+                    f"  B ({self.esp_devs[1].device}): {side_b}\n\n"
                     "Check the encoder firmware / wiring and restart this tool.",
                 )
                 return
 
             if side_a == "left":
-                left_esp, right_esp = self.esp_a, self.esp_b
+                left_esp, right_esp = self.esp_devs[0], self.esp_devs[1]
             else:
-                left_esp, right_esp = self.esp_b, self.esp_a
+                left_esp, right_esp = self.esp_devs[1], self.esp_devs[0]
 
             self.esp_role["left"] = left_esp.device
             self.esp_role["right"] = right_esp.device
@@ -858,6 +975,57 @@ def _run_gui(args: argparse.Namespace) -> None:
             self.auto_status_lbl.config(
                 text=f"Auto-assigned from encoder labels: A={side_a}, B={side_b}{hub_msg}",
                 foreground="#070" if "could not" not in hub_msg else "#a63",
+            )
+
+        def _try_auto_assign_single(self):
+            """Single-hand bootstrap: the encoder label must match the variant
+            side; the hand camera is its USB-hub mate, the other cam is center."""
+            hand_side = self.gripper_sides[0]
+            esp = self.esp_devs[0]
+            side = self.esp_side_detected.get(esp.device)
+
+            if not side:
+                return
+
+            self.auto_assigned = True
+            if side != hand_side:
+                self.auto_status_lbl.config(
+                    text=(
+                        f"Auto-assignment FAILED: encoder reports {side.upper()} "
+                        f"but variant {self.variant} expects {hand_side.upper()}"
+                    ),
+                    foreground="#a33",
+                )
+                messagebox.showerror(
+                    "Encoder side mismatch",
+                    f"The encoder ({esp.device}) reported side {side.upper()}, but "
+                    f"variant {self.variant} expects a {hand_side.upper()}-hand "
+                    "gripper.\n\n"
+                    "Check the encoder firmware DEVICE_ID (L###/R###) or re-run "
+                    "this tool with the correct --variant.",
+                )
+                return
+
+            cam_devs_with_hub: List[Tuple[str, Optional[str]]] = [
+                (d, usb_hub_of(video_dev_usb_location(d))) for d in self.cam_devs
+            ]
+            assignment = assign_camera_roles_single(
+                cam_devs_with_hub,
+                usb_hub_of(esp.location),
+                hand_side,
+            )
+            self.cam_role[hand_side] = assignment[hand_side]
+            self.cam_role["center"] = assignment["center"]
+
+            hub_msg = (
+                " (hand camera paired by USB hub)"
+                if assignment["matched"]
+                else " (could not match hand camera by USB hub; verify and use pulldown if needed)"
+            )
+            self.refresh_role_labels()
+            self.auto_status_lbl.config(
+                text=f"Auto-assigned from encoder label: {side.upper()}{hub_msg}",
+                foreground="#070" if assignment["matched"] else "#a63",
             )
 
         def cap_min_side(self, side: str):
@@ -893,10 +1061,10 @@ def _run_gui(args: argparse.Namespace) -> None:
                     err = rest[0] if rest else "unknown"
                     messagebox.showerror("Device error", f"{dev}:\n{err}")
 
-            for dev in (self.esp_a.device, self.esp_b.device):
+            for dev in self.esp_side_detected:
                 self.data[dev] = [(t, v) for (t, v) in self.data[dev] if now - t <= 5.0]
 
-            for side in ("left", "right"):
+            for side in self.gripper_sides:
                 dev = self.esp_role[side]
                 data = self.data.get(dev, []) if dev else []
                 x = [t - now for (t, _) in data]
@@ -940,33 +1108,38 @@ def _run_gui(args: argparse.Namespace) -> None:
                 return
 
             # Encoders
-            if not self.esp_role["left"] or not self.esp_role["right"]:
-                messagebox.showerror("Missing", "Please set ESP LEFT and RIGHT.")
-                return
-            if self.esp_role["left"] == self.esp_role["right"]:
-                messagebox.showerror("Invalid", "ESP LEFT and RIGHT cannot be the same.")
+            for side in self.gripper_sides:
+                if not self.esp_role.get(side):
+                    messagebox.showerror(
+                        "Missing", f"Please set ESP {side.upper()}."
+                    )
+                    return
+            esp_assigned = [self.esp_role[s] for s in self.gripper_sides]
+            if len(set(esp_assigned)) != len(esp_assigned):
+                messagebox.showerror(
+                    "Invalid", "ESP roles cannot be the same device."
+                )
                 return
 
-            for side in ("left", "right"):
+            for side in self.gripper_sides:
                 devnode = self.esp_role[side]
                 mi = self.calib_min.get(devnode)
                 if mi is None:
                     messagebox.showerror("Missing", f"Please capture MIN for ESP {side} ({devnode}).")
                     return
 
-            # Portable-only: gripper L/R labels must have been observed (so we know
-            # the encoder side mapping is correct), and re-check distinct devs +
-            # center set via the shared helper.
-            if self.variant == "portable":
-                err = can_apply_portable(self.esp_side_detected, self.cam_role)
+            # Portable family: gripper L/R labels must have been observed (so we
+            # know the encoder side mapping is correct), must match the variant
+            # side on single-hand rigs, and distinct devs + center set are
+            # re-checked via the shared helper.
+            if self.variant != "stationary":
+                err = can_apply(self.variant, self.esp_side_detected, self.cam_role)
                 if err:
                     messagebox.showerror("Not ready", err)
                     return
 
-            esp_by_dev = {self.esp_a.device: self.esp_a, self.esp_b.device: self.esp_b}
-            left_dev = esp_by_dev[self.esp_role["left"]]
-            right_dev = esp_by_dev[self.esp_role["right"]]
-            if not left_dev.serial or not right_dev.serial:
+            esp_by_dev = {d.device: d for d in self.esp_devs}
+            if any(not esp_by_dev[dev].serial for dev in esp_assigned):
                 messagebox.showerror(
                     "Missing serial",
                     "ESP serial_number is missing; cannot create stable udev rules.",
@@ -976,10 +1149,7 @@ def _run_gui(args: argparse.Namespace) -> None:
             out = build_apply_payload(
                 cam_role=self.cam_role,
                 esp_role=self.esp_role,
-                esp_serials={
-                    self.esp_a.device: self.esp_a.serial,
-                    self.esp_b.device: self.esp_b.serial,
-                },
+                esp_serials={d.device: d.serial for d in self.esp_devs},
                 calib_min=self.calib_min,
                 variant=self.variant,
             )
@@ -996,8 +1166,8 @@ def _run_gui(args: argparse.Namespace) -> None:
             try:
                 for r in self.cam_readers:
                     r.stop()
-                self.esp_reader_a.stop()
-                self.esp_reader_b.stop()
+                for r in self.esp_readers:
+                    r.stop()
             except Exception:
                 pass
 
@@ -1015,9 +1185,10 @@ def _run_gui(args: argparse.Namespace) -> None:
         raise SystemExit(2)
 
     esp_devs = find_esp_devices(args.esp_vid, args.esp_pid)
-    if len(esp_devs) != 2:
+    expected_esp = expected_esp_count(args.variant)
+    if len(esp_devs) != expected_esp:
         msg = (
-            f"Expected exactly 2 ESP32 tty devices with VID:PID="
+            f"Expected exactly {expected_esp} ESP32 tty device(s) with VID:PID="
             f"{args.esp_vid}:{args.esp_pid}, found {len(esp_devs)}\n"
         )
         for d in esp_devs:
@@ -1028,7 +1199,7 @@ def _run_gui(args: argparse.Namespace) -> None:
         raise SystemExit(3)
 
     root = tk.Tk()
-    App(root, cam_devs, esp_devs[0], esp_devs[1], args.baud, args.variant)
+    App(root, cam_devs, esp_devs, args.baud, args.variant)
     root.mainloop()
 
 
@@ -1046,7 +1217,11 @@ def main():
         "--variant",
         choices=list(SUPPORTED_VARIANTS),
         default="stationary",
-        help="Robot variant (default: stationary). 'portable' expects 3 cameras.",
+        help=(
+            "Robot variant (default: stationary). 'portable' expects 3 cameras "
+            "and 2 encoders; 'portable_left' / 'portable_right' expect 2 cameras "
+            "(hand + center) and 1 encoder."
+        ),
     )
     args = ap.parse_args()
     _run_gui(args)

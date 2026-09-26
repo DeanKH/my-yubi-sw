@@ -71,9 +71,22 @@ class TestDeepMerge:
             {"a": {"xs": [1]}}, {"a": {"xs": {"__extend__": [2, 3]}}}
         ) == {"a": {"xs": [1, 2, 3]}}
 
-    def test_overlay_none_replaces(self):
-        # Overlay None replaces (None is a valid YAML value, treated as scalar).
-        assert merger.deep_merge({"a": {"b": 1}}, {"a": None}) == {"a": None}
+    def test_overlay_null_removes_key(self):
+        # `key: null` in a dict overlay deletes the key from the base
+        # (explicit removal — used by single-hand variants to drop gate
+        # conditions for the absent hand).
+        assert merger.deep_merge(
+            {"a": {"b": 1, "c": 2}, "keep": 3}, {"a": None, "d": None}
+        ) == {"keep": 3}
+
+    def test_overlay_null_nested_removal(self):
+        assert merger.deep_merge(
+            {"g": {"conds": {"x": 1, "y": 2}}},
+            {"g": {"conds": {"y": None}}},
+        ) == {"g": {"conds": {"x": 1}}}
+
+    def test_overlay_null_absent_key_is_noop(self):
+        assert merger.deep_merge({"a": 1}, {"b": None}) == {"a": 1}
 
     def test_extend_requires_list_value(self):
         with pytest.raises(ValueError):
@@ -342,13 +355,118 @@ class TestPortableInvariants:
 
 
 # ---------------------------------------------------------------------------
+# TestPortableSingleInvariants — single-hand portable variants
+# ---------------------------------------------------------------------------
+class TestPortableSingleInvariants:
+    """Structure assertions for portable_left / portable_right outputs."""
+
+    @pytest.fixture(scope="class", params=["portable_left", "portable_right"])
+    def single_runtime(self, request):
+        merger.build(config_root=CONFIG_ROOT, variant=request.param, with_local=False)
+        return request.param, CONFIG_ROOT / "_runtime" / request.param
+
+    def test_robot_type(self, single_runtime):
+        variant, runtime = single_runtime
+        with (runtime / "robot_config.yaml").open() as f:
+            data = yaml.safe_load(f)
+        assert data["/**"]["ros__parameters"]["robot_type"] == f"yubi_{variant}"
+
+    def test_record_topics_contain_center_and_hand(self, single_runtime):
+        variant, runtime = single_runtime
+        side = variant.removeprefix("portable_")
+        with (runtime / "robot_config.yaml").open() as f:
+            data = yaml.safe_load(f)
+        rt = data["/**"]["ros__parameters"]["record_topics"]
+        assert "/center_camera/camera_info" in rt
+        assert "/center_camera/image_raw/compressed" in rt
+        assert f"/{side}_camera/camera_info" in rt
+        assert f"/yubi/gripper/{side}/joint_state" in rt
+        assert "/portable_joy_command" in rt
+
+    def test_gate_absent_side_conditions_removed(self, single_runtime):
+        variant, runtime = single_runtime
+        absent = "right" if variant == "portable_left" else "left"
+        with (runtime / "recording_gate.yaml").open() as f:
+            data = yaml.safe_load(f)
+        conditions = data["groups"]["health"]["conditions"]
+        for key in conditions:
+            assert not key.startswith(f"{absent}_"), (
+                f"{variant}: gate condition for absent side survived merge: {key}"
+            )
+        vr = data["groups"]["vr_tracking"]["conditions"]
+        for key in vr:
+            assert not key.startswith(f"{absent}_"), (
+                f"{variant}: vr_tracking condition for absent side survived: {key}"
+            )
+
+    def test_gate_present_side_and_head_kept(self, single_runtime):
+        variant, runtime = single_runtime
+        side = variant.removeprefix("portable_")
+        with (runtime / "recording_gate.yaml").open() as f:
+            data = yaml.safe_load(f)
+        conditions = data["groups"]["health"]["conditions"]
+        for key in (
+            "head_camera_warn",
+            "head_camera_stop",
+            "head_camera_timeout_warn",
+            "head_camera_timeout_stop",
+            f"{side}_camera_timeout_stop",
+            f"{side}_gripper_joint_state_timeout_stop",
+        ):
+            assert key in conditions, f"{variant}: missing gate condition {key}"
+
+    def test_gate_tf_single_frame(self, single_runtime):
+        variant, runtime = single_runtime
+        side = variant.removeprefix("portable_")
+        with (runtime / "recording_gate.yaml").open() as f:
+            data = yaml.safe_load(f)
+        warn_frames = data["groups"]["tf"]["conditions"]["quest_hands_warn"]["frames"]
+        stop_frames = data["groups"]["tf"]["conditions"]["quest_hands_stop"]["frames"]
+        assert warn_frames == [
+            {"source": "quest_origin", "target": f"{side}_hand_root", "max_age_sec": 1.0}
+        ]
+        assert stop_frames == [
+            {"source": "quest_origin", "target": f"{side}_hand_root", "max_age_sec": 5.0}
+        ]
+
+    def test_yubi_devices_single_hand(self, single_runtime):
+        variant, _runtime = single_runtime
+        side = variant.removeprefix("portable_")
+        absent = "right" if side == "left" else "left"
+        with (CONFIG_ROOT / variant / "yubi_devices.yaml").open() as f:
+            data = yaml.safe_load(f)
+        # Present hand camera + center camera sections exist...
+        assert f"{side}_camera/usb_cam" in data
+        assert "center_camera/usb_cam" in data
+        assert data["center_camera/usb_cam"]["ros__parameters"]["video_device"] == "/dev/yubi_center_camera"
+        # ...absent hand camera is not spawned...
+        assert f"{absent}_camera/usb_cam" not in data
+        # ...and the encoder disables the absent side via an empty port.
+        assert data["encoder_node"]["ros__parameters"][f"{absent}_port"] == ""
+        # Task-input nodes same as portable.
+        for key in (
+            "task_command_dispatch_node",
+            "gripper_double_click_node",
+            "portable_joy_command_node",
+        ):
+            assert key in data
+        assert "footpedal_node" not in data
+
+
+# ---------------------------------------------------------------------------
 # TestNodeRegistry — registry <-> YAML key bidirectional consistency
 # ---------------------------------------------------------------------------
 class TestNodeRegistry:
     @pytest.fixture(scope="class")
     def keys_per_variant(self):
         keys = {}
-        for variant in ("common", "stationary", "portable"):
+        for variant in (
+            "common",
+            "stationary",
+            "portable",
+            "portable_left",
+            "portable_right",
+        ):
             with (CONFIG_ROOT / variant / "yubi_devices.yaml").open() as f:
                 data = yaml.safe_load(f) or {}
             keys[variant] = set(data.keys())

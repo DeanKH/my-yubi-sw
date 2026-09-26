@@ -6,8 +6,9 @@ Covers the pure helpers used by `tools/yubi_udev_setup.sh` via its GUI:
 - usb_hub_of              — USB topology parent lookup (equivalence + boundary)
 - validate_cam_count      — variant ↔ camera-count gate (equivalence + boundary)
 - assign_camera_roles     — L/R/center auto-assignment (condition branching matrix)
+- assign_camera_roles_single — single-hand hand/center assignment (hub pairing)
 - resolve_camera_pick     — pulldown auto-swap (condition branching)
-- can_apply_portable      — portable APPLY pre-flight (condition branching truth table)
+- can_apply(_portable)    — portable-family APPLY pre-flight (condition branching truth table)
 - build_apply_payload     — JSON schema contract (variant branch)
 
 The GUI module lives outside yubi_bringup/, in repo-root tools/, so we add
@@ -131,6 +132,15 @@ class TestValidateCamCount:
         else:
             assert err is not None and "portable" in err and "3" in err
 
+    @pytest.mark.parametrize("variant", ["portable_left", "portable_right"])
+    @pytest.mark.parametrize("count", [0, 1, 2, 3, 4])
+    def test_single_hand_variants(self, variant, count):
+        err = gds.validate_cam_count(variant, count)
+        if count == 2:
+            assert err is None
+        else:
+            assert err is not None and variant in err and "2" in err
+
     def test_unknown_variant_reports_variant_name(self):
         err = gds.validate_cam_count("foo", 2)
         assert err is not None
@@ -149,9 +159,32 @@ class TestCamSidesFor:
     def test_portable_includes_center(self):
         assert gds.cam_sides_for("portable") == ("left", "right", "center")
 
+    def test_single_hand_variants(self):
+        assert gds.cam_sides_for("portable_left") == ("left", "center")
+        assert gds.cam_sides_for("portable_right") == ("right", "center")
+
     def test_unknown_raises(self):
         with pytest.raises(ValueError):
             gds.cam_sides_for("foo")
+
+
+# ---------------------------------------------------------------------------
+# TestGripperSidesAndEspCount — single-hand variant helper mappings
+# ---------------------------------------------------------------------------
+class TestGripperSidesAndEspCount:
+    def test_dual_variants_have_both_grippers(self):
+        assert gds.gripper_sides_for("stationary") == ("left", "right")
+        assert gds.gripper_sides_for("portable") == ("left", "right")
+
+    def test_single_variants_have_one_gripper(self):
+        assert gds.gripper_sides_for("portable_left") == ("left",)
+        assert gds.gripper_sides_for("portable_right") == ("right",)
+
+    def test_expected_esp_count(self):
+        assert gds.expected_esp_count("stationary") == 2
+        assert gds.expected_esp_count("portable") == 2
+        assert gds.expected_esp_count("portable_left") == 1
+        assert gds.expected_esp_count("portable_right") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +300,37 @@ class TestAssignCameraRoles:
         r1 = gds.assign_camera_roles(cams, "hA", "hB", "portable")
         r2 = gds.assign_camera_roles(cams, "hA", "hB", "portable")
         assert r1 == r2
+
+
+# ---------------------------------------------------------------------------
+# TestAssignCameraRolesSingle — single-hand hub-pairing assignment
+# ---------------------------------------------------------------------------
+class TestAssignCameraRolesSingle:
+    def test_hub_mate_is_hand(self):
+        cams = [("A", "hA"), ("B", "hB")]
+        res = gds.assign_camera_roles_single(cams, "hA", "left")
+        assert res == {"left": "A", "center": "B", "matched": True}
+
+    def test_order_swapped(self):
+        cams = [("A", "hB"), ("B", "hA")]
+        res = gds.assign_camera_roles_single(cams, "hA", "right")
+        assert res == {"right": "B", "center": "A", "matched": True}
+
+    def test_no_hub_match_falls_back_to_input_order(self):
+        cams = [("A", "hX"), ("B", "hY")]
+        res = gds.assign_camera_roles_single(cams, "hQ", "left")
+        assert res == {"left": "A", "center": "B", "matched": False}
+
+    def test_none_hub_falls_back(self):
+        cams = [("A", "hA"), ("B", "hB")]
+        res = gds.assign_camera_roles_single(cams, None, "left")
+        assert res == {"left": "A", "center": "B", "matched": False}
+
+    def test_result_is_deterministic(self):
+        cams = [("A", "hA"), ("B", "hB")]
+        assert gds.assign_camera_roles_single(cams, "hA", "left") == (
+            gds.assign_camera_roles_single(cams, "hA", "left")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +503,46 @@ class TestCanApplyPortable:
 
 
 # ---------------------------------------------------------------------------
+# TestCanApplySingle — single-hand APPLY gate
+# ---------------------------------------------------------------------------
+class TestCanApplySingle:
+    DEV = "/dev/ttyACM0"
+
+    def _esp(self, side):
+        return {self.DEV: side}
+
+    def _roles(self, side, ok=True):
+        if ok:
+            return {side: "/dev/video0", "center": "/dev/video2"}
+        # Duplicate: center equals the hand camera
+        return {side: "/dev/video0", "center": "/dev/video0"}
+
+    def test_matching_label_ok(self):
+        assert gds.can_apply("portable_left", self._esp("left"), self._roles("left")) is None
+        assert gds.can_apply("portable_right", self._esp("right"), self._roles("right")) is None
+
+    def test_missing_label_blocks(self):
+        err = gds.can_apply("portable_left", self._esp(None), self._roles("left"))
+        assert err is not None and self.DEV in err and "label" in err.lower()
+
+    def test_wrong_label_blocks_with_actionable_message(self):
+        err = gds.can_apply("portable_left", self._esp("right"), self._roles("left"))
+        assert err is not None
+        assert "RIGHT" in err and "LEFT" in err
+        assert "portable_left" in err
+
+    def test_unset_center_blocks(self):
+        err = gds.can_apply(
+            "portable_left", self._esp("left"), {"left": "/dev/video0", "center": None}
+        )
+        assert err is not None and "center" in err
+
+    def test_duplicate_devs_block(self):
+        err = gds.can_apply("portable_left", self._esp("left"), self._roles("left", ok=False))
+        assert err is not None and "distinct" in err
+
+
+# ---------------------------------------------------------------------------
 # TestBuildApplyPayload — schema contract, variant branch
 # ---------------------------------------------------------------------------
 class TestBuildApplyPayload:
@@ -466,6 +570,36 @@ class TestBuildApplyPayload:
     def test_portable_includes_center(self):
         payload = gds.build_apply_payload(**self._common_kwargs("portable", True))
         assert payload["camera"]["center"] == {"dev": "/dev/video4"}
+
+    def test_single_hand_payload_left(self):
+        payload = gds.build_apply_payload(
+            cam_role={"left": "/dev/video0", "center": "/dev/video4"},
+            esp_role={"left": self.L},
+            esp_serials={self.L: "SL"},
+            calib_min={self.L: 1234.5},
+            variant="portable_left",
+        )
+        assert payload["camera"] == {
+            "left": {"dev": "/dev/video0"},
+            "center": {"dev": "/dev/video4"},
+        }
+        assert payload["esp32"] == {
+            "left": {"dev": self.L, "serial": "SL", "min": 1234.5},
+        }
+        assert payload["encoder_node"]["ros__parameters"] == {"left_min_raw": 1234.5}
+
+    def test_single_hand_payload_right(self):
+        payload = gds.build_apply_payload(
+            cam_role={"right": "/dev/video2", "center": "/dev/video4"},
+            esp_role={"right": self.R},
+            esp_serials={self.R: "SR"},
+            calib_min={self.R: 6789.0},
+            variant="portable_right",
+        )
+        assert payload["esp32"] == {
+            "right": {"dev": self.R, "serial": "SR", "min": 6789.0},
+        }
+        assert payload["encoder_node"]["ros__parameters"] == {"right_min_raw": 6789.0}
 
     def test_esp_block_contract(self):
         payload = gds.build_apply_payload(**self._common_kwargs("stationary", False))
@@ -501,10 +635,22 @@ class TestModuleLoadsWithoutHeavyDeps:
         assert callable(gds.usb_hub_of)
         assert callable(gds.validate_cam_count)
         assert callable(gds.assign_camera_roles)
+        assert callable(gds.assign_camera_roles_single)
         assert callable(gds.resolve_camera_pick)
+        assert callable(gds.can_apply)
         assert callable(gds.can_apply_portable)
         assert callable(gds.build_apply_payload)
         # Module-level constants exist (the sh script's behaviour relies on
         # the same definitions, but we at least pin them on the Python side).
-        assert gds.EXPECTED_CAM_COUNT == {"stationary": 2, "portable": 3}
-        assert gds.SUPPORTED_VARIANTS == ("stationary", "portable")
+        assert gds.EXPECTED_CAM_COUNT == {
+            "stationary": 2,
+            "portable": 3,
+            "portable_left": 2,
+            "portable_right": 2,
+        }
+        assert gds.SUPPORTED_VARIANTS == (
+            "stationary",
+            "portable",
+            "portable_left",
+            "portable_right",
+        )

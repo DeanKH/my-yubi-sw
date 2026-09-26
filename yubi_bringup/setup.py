@@ -18,6 +18,14 @@ setup(
             glob("config/stationary/*.yaml"),
         ),
         ("share/" + package_name + "/config/portable", glob("config/portable/*.yaml")),
+        (
+            "share/" + package_name + "/config/portable_left",
+            glob("config/portable_left/*.yaml"),
+        ),
+        (
+            "share/" + package_name + "/config/portable_right",
+            glob("config/portable_right/*.yaml"),
+        ),
         # local/ holds per-host overrides (gitignored). Installed when present so
         # the launch file can pick them up; users must re-run colcon build after
         # creating a new local/<file>.yaml.

@@ -9,6 +9,7 @@ For each of (robot_config.yaml, recording_gate.yaml, upload_targets.yaml), this 
 
 Merge semantics (deep_merge):
   - dict + dict       -> recursive merge per key (b wins on scalar conflict)
+  - dict key + null   -> remove the key from the base (explicit deletion)
   - list + list       -> b replaces a entirely
   - list + {__extend__: [...]} -> append unique items from extend list to base list
   - scalar override   -> b wins
@@ -47,7 +48,10 @@ def deep_merge(base: Any, overlay: Any) -> Any:
     if isinstance(base, dict) and isinstance(overlay, dict):
         result = dict(base)
         for key, overlay_val in overlay.items():
-            if key in result:
+            if overlay_val is None:
+                # Explicit deletion: `key: null` in an overlay removes the key.
+                result.pop(key, None)
+            elif key in result:
                 result[key] = deep_merge(result[key], overlay_val)
             else:
                 result[key] = overlay_val

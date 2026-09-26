@@ -131,12 +131,29 @@ class DualEncoderJointStateNode(Node):
             lock=threading.Lock(),
         )
 
+        # Empty port disables that side (single-hand variants set e.g.
+        # right_port: "" so the absent gripper is skipped entirely).
+        self.left_enabled = bool(left_port)
+        self.right_enabled = bool(right_port)
+        if not self.left_enabled:
+            self.get_logger().info("Left encoder disabled (left_port is empty).")
+        if not self.right_enabled:
+            self.get_logger().info("Right encoder disabled (right_port is empty).")
+        if not self.left_enabled and not self.right_enabled:
+            self.get_logger().error(
+                "Both encoder ports are empty — no encoder input will be published."
+            )
+
         # --- Background reader threads (so one port never blocks the other) ---
         self._stop = threading.Event()
-        self._t_left = threading.Thread(target=self._reader_loop, args=("left", self.left_state), daemon=True)
-        self._t_right = threading.Thread(target=self._reader_loop, args=("right", self.right_state), daemon=True)
-        self._t_left.start()
-        self._t_right.start()
+        self._t_left = None
+        self._t_right = None
+        if self.left_enabled:
+            self._t_left = threading.Thread(target=self._reader_loop, args=("left", self.left_state), daemon=True)
+            self._t_left.start()
+        if self.right_enabled:
+            self._t_right = threading.Thread(target=self._reader_loop, args=("right", self.right_state), daemon=True)
+            self._t_right.start()
 
         # --- Publisher/timer ---
         self.pub = self.create_publisher(JointState, topic, 10)
@@ -156,12 +173,14 @@ class DualEncoderJointStateNode(Node):
         self._last_right_id = None
 
         # --- Publish encoder offsets once (latched via TRANSIENT_LOCAL) ---
-        left_offset_msg = Float64()
-        left_offset_msg.data = self.left_offset
-        self.left_offset_pub.publish(left_offset_msg)
-        right_offset_msg = Float64()
-        right_offset_msg.data = self.right_offset
-        self.right_offset_pub.publish(right_offset_msg)
+        if self.left_enabled:
+            left_offset_msg = Float64()
+            left_offset_msg.data = self.left_offset
+            self.left_offset_pub.publish(left_offset_msg)
+        if self.right_enabled:
+            right_offset_msg = Float64()
+            right_offset_msg.data = self.right_offset
+            self.right_offset_pub.publish(right_offset_msg)
 
     def destroy_node(self):
         # stop threads and close ports
@@ -292,6 +311,8 @@ class DualEncoderJointStateNode(Node):
 
         stamp = self.get_clock().now().to_msg()
 
+        # Collect (joint_name, value) from every enabled side that has data.
+        joints = []
         if left_v is not None:
             left_msg = JointState()
             left_msg.header.stamp = stamp
@@ -300,6 +321,8 @@ class DualEncoderJointStateNode(Node):
             left_msg.name = [self.left_joint_name]
             left_msg.position = [float(left_v)]
             self.left_pub.publish(left_msg)
+            if self.left_enabled:
+                joints.append((self.left_joint_name, left_v))
 
         if right_v is not None:
             right_msg = JointState()
@@ -309,14 +332,20 @@ class DualEncoderJointStateNode(Node):
             right_msg.name = [self.right_joint_name]
             right_msg.position = [float(right_v)]
             self.right_pub.publish(right_msg)
+            if self.right_enabled:
+                joints.append((self.right_joint_name, right_v))
 
-        if left_v is not None and right_v is not None:
+        # Combined /joint_states publishes when EVERY enabled side has data
+        # (single-hand variants have one enabled side; dual variants keep the
+        # original behaviour of pausing while either side is missing).
+        enabled_count = int(self.left_enabled) + int(self.right_enabled)
+        if joints and len(joints) == enabled_count:
             msg = JointState()
             msg.header.stamp = stamp
             if self.frame_id:
                 msg.header.frame_id = self.frame_id
-            msg.name = [self.left_joint_name, self.right_joint_name]
-            msg.position = [float(left_v), float(right_v)]
+            msg.name = [name for name, _ in joints]
+            msg.position = [float(v) for _, v in joints]
             self.pub.publish(msg)
 
         # Publish device IDs only when they change
@@ -337,8 +366,15 @@ class DualEncoderJointStateNode(Node):
             right_id_msg.data = right_id
             self.right_id_pub.publish(right_id_msg)
 
-        if left_id is not None and right_id is not None:
-            new_data = json.dumps({"left": left_id, "right": right_id})
+        # Combined device-id JSON includes only the enabled sides and is
+        # published once every enabled side has reported its device_id.
+        id_parts = {}
+        if self.left_enabled and left_id is not None:
+            id_parts["left"] = left_id
+        if self.right_enabled and right_id is not None:
+            id_parts["right"] = right_id
+        if len(id_parts) == enabled_count:
+            new_data = json.dumps(id_parts)
             if self._last_id_data != new_data:
                 self._last_id_data = new_data
                 id_msg = String()

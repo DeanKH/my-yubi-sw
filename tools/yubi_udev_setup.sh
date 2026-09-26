@@ -4,9 +4,12 @@ set -euo pipefail
 # -----------------------
 # Variant resolution: CLI flag overrides ROBOT_VARIANT env var; default
 # stationary (matches docker-compose / launch defaults). 'portable' expects
-# 3 USB cameras (same VID/PID); 'stationary' expects 2.
+# 3 USB cameras (same VID/PID); 'stationary' expects 2; the single-hand
+# variants 'portable_left' / 'portable_right' expect 2 (one hand + center)
+# and a single gripper encoder.
 # -----------------------
 VARIANT="${ROBOT_VARIANT:-stationary}"
+SINGLE_SIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --variant)
@@ -20,15 +23,21 @@ while [[ $# -gt 0 ]]; do
       ;;
     -h|--help)
       cat <<'USAGE'
-Usage: sudo -E ./tools/yubi_udev_setup.sh [--variant stationary|portable]
+Usage: sudo -E ./tools/yubi_udev_setup.sh [--variant stationary|portable|portable_left|portable_right]
 
 Calibrates the gripper encoders and writes /etc/udev/rules.d/99-yubi-devices.rules.
 
 Variant selection (precedence: CLI flag > $ROBOT_VARIANT env var > stationary):
-  stationary  expects 2 USB cameras (left, right)
-  portable    expects 3 USB cameras (left, right, center/head) — the head
-              camera is the same USB model as the hands, so we use the
-              gripper L/R USB-hub topology to identify which is which.
+  stationary      expects 2 USB cameras (left, right) and 2 encoders
+  portable        expects 3 USB cameras (left, right, center/head) and 2 encoders
+  portable_left   single-hand rig: expects 2 USB cameras (left + center/head)
+                  and 1 encoder
+  portable_right  single-hand rig: expects 2 USB cameras (right + center/head)
+                  and 1 encoder
+
+For portable_left / portable_right the hand camera is identified as the
+USB-hub mate of the (single) gripper encoder; the remaining camera is the
+center/head camera.
 USAGE
       exit 0
       ;;
@@ -41,12 +50,20 @@ done
 case "$VARIANT" in
   stationary) EXPECTED_CAM_COUNT=2 ;;
   portable)   EXPECTED_CAM_COUNT=3 ;;
+  portable_left|portable_right)
+    EXPECTED_CAM_COUNT=2
+    SINGLE_SIDE="${VARIANT#portable_}"   # left | right
+    ;;
   *)
-    echo "ERROR: unsupported variant: $VARIANT (expected: stationary, portable)"
+    echo "ERROR: unsupported variant: $VARIANT (expected: stationary, portable, portable_left, portable_right)"
     exit 2
     ;;
 esac
-echo "Variant: $VARIANT (expect $EXPECTED_CAM_COUNT cameras)"
+if [[ -n "$SINGLE_SIDE" ]]; then
+  echo "Variant: $VARIANT (expect $EXPECTED_CAM_COUNT cameras, single $SINGLE_SIDE hand)"
+else
+  echo "Variant: $VARIANT (expect $EXPECTED_CAM_COUNT cameras)"
+fi
 
 # -----------------------
 # Pause the yubi container while we rewrite udev rules, so it doesn't
@@ -274,46 +291,69 @@ fi
 result_json="$(python3 "$GUI" "${GUI_ARGS[@]}")"
 
 # Parse JSON in bash via python (robust)
-cam_left="$(python3 - <<PY
+if [[ -n "$SINGLE_SIDE" ]]; then
+  cam_hand="$(python3 - <<PY
 import json
-print(json.loads('''$result_json''')["camera"]["left"]["dev"])
+print(json.loads('''$result_json''')["camera"]["$SINGLE_SIDE"]["dev"])
 PY
 )"
-cam_right="$(python3 - <<PY
-import json
-print(json.loads('''$result_json''')["camera"]["right"]["dev"])
-PY
-)"
-cam_center=""
-if [[ "$VARIANT" == "portable" ]]; then
   cam_center="$(python3 - <<PY
 import json
 print(json.loads('''$result_json''')["camera"]["center"]["dev"])
 PY
 )"
-fi
+  esp_hand_serial="$(python3 - <<PY
+import json
+print(json.loads('''$result_json''')["esp32"]["$SINGLE_SIDE"]["serial"])
+PY
+)"
+  hand_min="$(python3 - <<PY
+import json
+print(json.loads('''$result_json''')["esp32"]["$SINGLE_SIDE"]["min"])
+PY
+)"
+else
+  cam_left="$(python3 - <<PY
+import json
+print(json.loads('''$result_json''')["camera"]["left"]["dev"])
+PY
+)"
+  cam_right="$(python3 - <<PY
+import json
+print(json.loads('''$result_json''')["camera"]["right"]["dev"])
+PY
+)"
+  cam_center=""
+  if [[ "$VARIANT" == "portable" ]]; then
+    cam_center="$(python3 - <<PY
+import json
+print(json.loads('''$result_json''')["camera"]["center"]["dev"])
+PY
+)"
+  fi
 
-esp_left_serial="$(python3 - <<PY
+  esp_left_serial="$(python3 - <<PY
 import json
 print(json.loads('''$result_json''')["esp32"]["left"]["serial"])
 PY
 )"
-esp_right_serial="$(python3 - <<PY
+  esp_right_serial="$(python3 - <<PY
 import json
 print(json.loads('''$result_json''')["esp32"]["right"]["serial"])
 PY
 )"
 
-left_min="$(python3 - <<PY
+  left_min="$(python3 - <<PY
 import json
 print(json.loads('''$result_json''')["esp32"]["left"]["min"])
 PY
 )"
-right_min="$(python3 - <<PY
+  right_min="$(python3 - <<PY
 import json
 print(json.loads('''$result_json''')["esp32"]["right"]["min"])
 PY
 )"
+fi
 
 # Map camera dev -> ID_PATH
 declare -A CAM_PATH_BY_DEV
@@ -322,22 +362,30 @@ CAM_PATH_BY_DEV["$cam2"]="$cam2_path"
 if [[ -n "$cam3" ]]; then
   CAM_PATH_BY_DEV["$cam3"]="$cam3_path"
 fi
-cam_left_path="${CAM_PATH_BY_DEV[$cam_left]}"
-cam_right_path="${CAM_PATH_BY_DEV[$cam_right]}"
-cam_center_path=""
-if [[ -n "$cam_center" ]]; then
-  cam_center_path="${CAM_PATH_BY_DEV[$cam_center]}"
-fi
 
 echo
 echo "Assigned:"
-echo "  Camera left  : $cam_left  ID_PATH=$cam_left_path"
-echo "  Camera right : $cam_right ID_PATH=$cam_right_path"
-if [[ -n "$cam_center" ]]; then
-  echo "  Camera center: $cam_center ID_PATH=$cam_center_path"
+if [[ -n "$SINGLE_SIDE" ]]; then
+  cam_hand_path="${CAM_PATH_BY_DEV[$cam_hand]}"
+  cam_center_path="${CAM_PATH_BY_DEV[$cam_center]}"
+  echo "  Camera $SINGLE_SIDE: $cam_hand    ID_PATH=$cam_hand_path"
+  echo "  Camera center : $cam_center ID_PATH=$cam_center_path"
+  echo "  ESP32 $SINGLE_SIDE : serial=$esp_hand_serial  min=$hand_min"
+else
+  cam_left_path="${CAM_PATH_BY_DEV[$cam_left]}"
+  cam_right_path="${CAM_PATH_BY_DEV[$cam_right]}"
+  cam_center_path=""
+  if [[ -n "$cam_center" ]]; then
+    cam_center_path="${CAM_PATH_BY_DEV[$cam_center]}"
+  fi
+  echo "  Camera left  : $cam_left  ID_PATH=$cam_left_path"
+  echo "  Camera right : $cam_right ID_PATH=$cam_right_path"
+  if [[ -n "$cam_center" ]]; then
+    echo "  Camera center: $cam_center ID_PATH=$cam_center_path"
+  fi
+  echo "  ESP32 left   : serial=$esp_left_serial  min=$left_min"
+  echo "  ESP32 right  : serial=$esp_right_serial min=$right_min"
 fi
-echo "  ESP32 left   : serial=$esp_left_serial  min=$left_min"
-echo "  ESP32 right  : serial=$esp_right_serial min=$right_min"
 echo
 
 # -----------------------
@@ -346,13 +394,22 @@ echo
 mkdir -p "$CALIB_DIR"
 timestamp="$(date --iso-8601=seconds)"
 
-cat > "$CALIB_FILE" <<EOF
+if [[ -n "$SINGLE_SIDE" ]]; then
+  cat > "$CALIB_FILE" <<EOF
+# Auto-generated by yubi_udev_setup.sh on $timestamp
+encoder_node:
+  ros__parameters:
+    ${SINGLE_SIDE}_min_raw: $hand_min
+EOF
+else
+  cat > "$CALIB_FILE" <<EOF
 # Auto-generated by yubi_udev_setup.sh on $timestamp
 encoder_node:
   ros__parameters:
     left_min_raw: $left_min
     right_min_raw: $right_min
 EOF
+fi
 
 chmod 644 "$CALIB_FILE"
 echo "Wrote: $CALIB_FILE"
@@ -364,26 +421,42 @@ if [[ -f "$RULE_FILE" ]]; then
   cp -a "$RULE_FILE" "${RULE_FILE}.$(date +%Y%m%d_%H%M%S).bak"
 fi
 
-cat > "$RULE_FILE" <<EOF
+if [[ -n "$SINGLE_SIDE" ]]; then
+  HAND_SYMLINK="yubi_${SINGLE_SIDE}_camera"
+  ESP_SYMLINK="yubi_${SINGLE_SIDE}_esp32c6"
+
+  cat > "$RULE_FILE" <<EOF
+# Auto-generated by yubi_udev_setup.sh (variant=$VARIANT)
+# Cameras (UVC): $CAM_VID:$CAM_PID index=0
+SUBSYSTEM=="video4linux", KERNEL=="video*", ATTRS{idVendor}=="$CAM_VID", ATTRS{idProduct}=="$CAM_PID", ATTR{index}=="0", ENV{ID_PATH}=="$cam_hand_path",   SYMLINK+="$HAND_SYMLINK"
+SUBSYSTEM=="video4linux", KERNEL=="video*", ATTRS{idVendor}=="$CAM_VID", ATTRS{idProduct}=="$CAM_PID", ATTR{index}=="0", ENV{ID_PATH}=="$cam_center_path", SYMLINK+="$CAM_CENTER_SYMLINK"
+
+# ESP32C6 USB JTAG/serial: $ESP_VID:$ESP_PID
+# Use serial to distinguish; also ignore ModemManager
+SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="$ESP_VID", ENV{ID_MODEL_ID}=="$ESP_PID", ENV{ID_SERIAL_SHORT}=="$esp_hand_serial", SYMLINK+="$ESP_SYMLINK", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"
+EOF
+else
+  cat > "$RULE_FILE" <<EOF
 # Auto-generated by yubi_udev_setup.sh (variant=$VARIANT)
 # Cameras (UVC): $CAM_VID:$CAM_PID index=0
 SUBSYSTEM=="video4linux", KERNEL=="video*", ATTRS{idVendor}=="$CAM_VID", ATTRS{idProduct}=="$CAM_PID", ATTR{index}=="0", ENV{ID_PATH}=="$cam_left_path",  SYMLINK+="$CAM_LEFT_SYMLINK"
 SUBSYSTEM=="video4linux", KERNEL=="video*", ATTRS{idVendor}=="$CAM_VID", ATTRS{idProduct}=="$CAM_PID", ATTR{index}=="0", ENV{ID_PATH}=="$cam_right_path", SYMLINK+="$CAM_RIGHT_SYMLINK"
 EOF
 
-if [[ -n "$cam_center_path" ]]; then
-  cat >> "$RULE_FILE" <<EOF
+  if [[ -n "$cam_center_path" ]]; then
+    cat >> "$RULE_FILE" <<EOF
 SUBSYSTEM=="video4linux", KERNEL=="video*", ATTRS{idVendor}=="$CAM_VID", ATTRS{idProduct}=="$CAM_PID", ATTR{index}=="0", ENV{ID_PATH}=="$cam_center_path", SYMLINK+="$CAM_CENTER_SYMLINK"
 EOF
-fi
+  fi
 
-cat >> "$RULE_FILE" <<EOF
+  cat >> "$RULE_FILE" <<EOF
 
 # ESP32C6 USB JTAG/serial: $ESP_VID:$ESP_PID
 # Use serial to distinguish; also ignore ModemManager
 SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="$ESP_VID", ENV{ID_MODEL_ID}=="$ESP_PID", ENV{ID_SERIAL_SHORT}=="$esp_left_serial",  SYMLINK+="$ESP_LEFT_SYMLINK",  ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"
 SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="$ESP_VID", ENV{ID_MODEL_ID}=="$ESP_PID", ENV{ID_SERIAL_SHORT}=="$esp_right_serial", SYMLINK+="$ESP_RIGHT_SYMLINK", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"
 EOF
+fi
 
 chmod 644 "$RULE_FILE"
 echo "Wrote: $RULE_FILE"

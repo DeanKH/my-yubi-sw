@@ -1,0 +1,22 @@
+# Portable (left hand only) — overlay onto common/robot_config.yaml
+# Sets robot_type and appends USB center-camera topics to record_topics.
+#
+# Note: topics of the absent right gripper (e.g. /right_camera/*,
+# /yubi/gripper/right/*) remain in the merged record_topics inherited from
+# common/ — rosbag2 simply skips topics that are never advertised (same as
+# /footpedal_states on portable rigs). Gate conditions are handled in
+# recording_gate.yaml.
+
+/**:
+  ros__parameters:
+    robot_type: "yubi_portable_left"
+
+    record_topics:
+      __extend__:
+        - "/center_camera/camera_info"
+        - "/center_camera/image_raw/compressed"
+        # Aggregated joy stream consumed by task_command_dispatch_node (variant input).
+        - "/portable_joy_command"
+        # Per-gripper double-click intermediates feeding /portable_joy_command.
+        - "/yubi/gripper/left/double_click_state"
+        - "/yubi/gripper/right/double_click_state"
