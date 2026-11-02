@@ -55,7 +55,7 @@ task_command_dispatch_node:
     # gripper double-click + Quest controller buttons by portable_joy_command_node).
     # Button layout — see yubi_bringup/portable_joy_command_node.py:
     #   [0] quest_x
-    #   [1] quest_b
+    #   [1] quest_b (right) | quest_y (left)
     #   [2] gripper double-click | quest_a
     joy_accept_button: 2
     joy_reject_button: 1

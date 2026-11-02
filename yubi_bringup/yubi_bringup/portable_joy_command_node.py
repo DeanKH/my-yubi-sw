@@ -20,9 +20,13 @@ from sensor_msgs.msg import Joy
 # downstream consumers can rely on it.
 #
 # buttons:
-#   [0] quest_button_x
-#   [1] quest_button_b
-#   [2] gripper_double_click or quest_button_a
+#   [0] quest_button_x (left controller X)
+#   [1] quest_button_b (right controller B) | quest_button_y (left controller Y)
+#   [2] gripper_double_click | quest_button_a (right controller A)
+#
+# The left controller's Y (secondary) mirrors the right controller's B
+# (secondary) so single-hand rigs that only hold the left controller can
+# still reject.
 _BTN_QUEST_X = 0
 _BTN_QUEST_B = 1
 _BTN_DOUBLE_CLICK_OR_QUEST_A = 2
@@ -50,6 +54,7 @@ class PortableJoyCommandNode(Node):
         self._a_button_state = 0
         self._b_button_state = 0
         self._x_button_state = 0
+        self._y_button_state = 0
         
         # Aggregated buttons
         self._button_states = [0] * _NUM_BUTTONS
@@ -106,6 +111,9 @@ class PortableJoyCommandNode(Node):
     
     def _left_quest_state_callback(self, msg: Joy) -> None:
         self._x_button_state = int(msg.buttons[0]) if msg.buttons else 0
+        # Left controller Y (secondary) maps to the same slot as right
+        # controller B (secondary) — see the button layout comment above.
+        self._y_button_state = int(msg.buttons[1]) if len(msg.buttons) > 1 else 0
         self._publish_portable_joy_command()
     
     def _right_quest_state_callback(self, msg: Joy) -> None:
@@ -118,7 +126,7 @@ class PortableJoyCommandNode(Node):
         self._button_states[_BTN_DOUBLE_CLICK_OR_QUEST_A] = (
             self._left_double_click | self._right_double_click | self._a_button_state
         )
-        self._button_states[_BTN_QUEST_B] = self._b_button_state
+        self._button_states[_BTN_QUEST_B] = self._b_button_state | self._y_button_state
         self._button_states[_BTN_QUEST_X] = self._x_button_state
 
         joy = Joy()
