@@ -23,6 +23,7 @@ wheels/
 # Data files
 data/
 minio_data/
+rustfs_data/
 test_data/
 *.h5
 *.csv

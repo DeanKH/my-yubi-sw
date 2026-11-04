@@ -289,18 +289,19 @@ The full workflow across the YUBI stack:
    then operate the device to record episodes for the assigned task.
 
 4. **Recordings upload automatically.** When an episode finishes, it is
-   uploaded to the **local MinIO** by default. To push to an external/remote
-   S3 target instead, configure `upload_targets.yaml` — see the
+   uploaded to the **local RustFS** (S3-compatible object storage) by default.
+   To push to an external/remote S3 target instead, configure
+   `upload_targets.yaml` — see the
    [yubi-core upload reference](https://github.com/airoa-org/yubi-core/blob/main/docs/configuration.md#upload_targetsyaml).
 
-5. **Download and process.** Fetch the recordings from MinIO, then turn them
-   into training data with [rebake](https://github.com/airoa-org/rebake).
+5. **Download and process.** Fetch the recordings from RustFS, then turn
+   them into training data with [rebake](https://github.com/airoa-org/rebake).
 
-   With the [MinIO client](https://min.io/docs/minio/linux/reference/minio-mc.html) (`mc`):
+   With the [RustFS client](https://github.com/rustfs/cli) (`rc`):
 
    ```bash
-   mc alias set yubi http://localhost:9000 minioadmin minioadmin
-   mc cp --recursive yubi/data/ ./recordings/
+   rc alias set yubi http://localhost:9000 minioadmin minioadmin
+   rc cp -r yubi/data/ ./recordings/
    ```
 
    …or with the AWS CLI:
@@ -316,8 +317,8 @@ The `docker-compose.yml` starts the following services:
 
 | Service | Container name | Description |
 |---------|----------------|-------------|
-| `minio` | `minio` | S3-compatible object storage for recordings |
-| `minio-init` | `minio-init` | One-shot init container that creates the `data` bucket |
+| `rustfs` | `rustfs` | S3-compatible object storage for recordings |
+| `rustfs-init` | `rustfs-init` | One-shot init container that creates the `data` bucket |
 | `yubi` | `yubi` | Yubi bringup: hardware drivers, cameras, footpedal, rosbridge, task command dispatch |
 | `yubi_core` | `yubi_core` | AIRoA data collection: task receiver, record manager, recording gate, recording uploader, task sequence manager |
 | `yubi_core_builder` | _(build-only)_ | Image build target for the `yubi_core` Dockerfile. Gated by the `build-only` compose profile so it is not started at runtime. |

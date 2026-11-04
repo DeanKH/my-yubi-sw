@@ -3,22 +3,28 @@ networks:
     driver: bridge
 
 services:
-  minio:
-    image: minio/minio:latest
-    container_name: minio
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
     ports:
       - "9000:9000"
       - "9001:9001"
     env_file:
       - .env
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-minioadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-minioadmin}
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_VOLUMES: /data
     volumes:
-      - ${MINIO_DATA_PATH:-./minio_data}:/data
-    command: server /data --console-address ":9001"
+      - ${RUSTFS_DATA_PATH:-./rustfs_data}:/data
+    depends_on:
+      rustfs-permissions:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -26,20 +32,33 @@ services:
     networks:
       - datalake_net
 
-  minio-init:
-    image: minio/mc:latest
-    container_name: minio-init
+  # The rustfs/rustfs image runs as the non-root user 10001:10001, so the
+  # bind-mounted data directory must be chowned to that user before the
+  # server starts.
+  rustfs-permissions:
+    image: alpine:3
+    container_name: rustfs-permissions
+    volumes:
+      - ${RUSTFS_DATA_PATH:-./rustfs_data}:/data
+    command: ["chown", "-R", "10001:10001", "/data"]
+    restart: "no"
+    networks:
+      - datalake_net
+
+  rustfs-init:
+    image: rustfs/rc:latest
+    container_name: rustfs-init
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-minioadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-minioadmin}
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
-      mc mb --ignore-existing local/data;
-      echo 'MinIO bucket created: data';
+      rc alias set local http://rustfs:9000 $${RUSTFS_ACCESS_KEY} $${RUSTFS_SECRET_KEY};
+      rc mb --ignore-existing local/data;
+      echo 'RustFS bucket created: data';
       "
     restart: "no"
     networks:
@@ -116,7 +135,7 @@ services:
     stdin_open: true
     tty: true
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
       config-init:
         condition: service_completed_successfully
