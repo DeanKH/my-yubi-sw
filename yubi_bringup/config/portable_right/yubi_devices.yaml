@@ -46,12 +46,12 @@ task_command_dispatch_node:
     # Portable input source: /portable_joy_command (aggregated from right
     # gripper double-click + Quest controller buttons by portable_joy_command_node).
     # Button layout — see yubi_bringup/portable_joy_command_node.py:
-    #   [0] quest_x
-    #   [1] quest_b (right) | quest_y (left)
-    #   [2] gripper double-click | quest_a
-    joy_accept_button: 2
+    #   [0] quest_x (left controller X) — accept
+    #   [1] quest_b (right) | quest_y (left controller Y) — reject
+    #   [2] gripper double-click | quest_a — cancel episode
+    joy_accept_button: 0
     joy_reject_button: 1
-    joy_cancel_episode_button: 0
+    joy_cancel_episode_button: 2
     joy_rewind_button: -1
 
 # Presence markers — spawn the per-gripper double-click detector and the
